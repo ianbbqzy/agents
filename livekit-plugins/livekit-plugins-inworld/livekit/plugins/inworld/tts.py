@@ -107,6 +107,7 @@ class _ContextInfo:
     segment_started: bool = False
     created_at: float = field(default_factory=time.time)
     close_started_at: float | None = None
+    ready_event: asyncio.Event | None = None  # Set when contextCreated is received (for warm)
 
 
 @dataclass
@@ -423,6 +424,8 @@ class _InworldConnection:
 
                 if "contextCreated" in result:
                     ctx.state = _ContextState.ACTIVE
+                    if ctx.ready_event:
+                        ctx.ready_event.set()
                     continue
 
                 if audio_chunk := result.get("audioChunk"):
@@ -521,6 +524,17 @@ DEFAULT_MAX_CONNECTIONS = 20
 DEFAULT_IDLE_CONNECTION_TIMEOUT = 300.0  # 5 minutes
 
 
+@dataclass
+class _WarmContext:
+    """A pre-created context ready to be claimed by a stream."""
+
+    context_id: str
+    connection: _InworldConnection
+    opts: _TTSOptions
+    ready_event: asyncio.Event
+    created_at: float = field(default_factory=time.time)
+
+
 class _ConnectionPool:
     """Manages a pool of _InworldConnection instances for high-concurrency scenarios.
 
@@ -554,6 +568,22 @@ class _ConnectionPool:
         # Cleanup task
         self._cleanup_task: asyncio.Task[None] | None = None
 
+        # Warm context pool - pre-created contexts ready for immediate use
+        self._warm_context: _WarmContext | None = None
+        self._warm_context_opts: _TTSOptions | None = None  # Last used opts for warming
+
+    def _opts_match(self, a: _TTSOptions, b: _TTSOptions) -> bool:
+        """Check if two options are compatible for context reuse."""
+        return (
+            a.voice == b.voice
+            and a.model == b.model
+            and a.encoding == b.encoding
+            and a.sample_rate == b.sample_rate
+            and a.bit_rate == b.bit_rate
+            and a.speaking_rate == b.speaking_rate
+            and a.temperature == b.temperature
+        )
+
     async def acquire_context(
         self,
         emitter: tts.AudioEmitter,
@@ -569,6 +599,50 @@ class _ConnectionPool:
         if self._closed:
             raise APIConnectionError("Connection pool is closed")
 
+        # Remember opts for warming the next context
+        self._warm_context_opts = opts
+
+        # Try to use a warm context first
+        warm = self._warm_context
+        if warm is not None and self._opts_match(warm.opts, opts):
+            self._warm_context = None  # Claim it
+            try:
+                # Wait for context to be ready (contextCreated received)
+                await asyncio.wait_for(warm.ready_event.wait(), timeout=min(timeout, 5.0))
+
+                # Verify the context is still valid
+                ctx_info = warm.connection._contexts.get(warm.context_id)
+                if ctx_info and ctx_info.state == _ContextState.ACTIVE:
+                    # Bind the emitter and create the waiter
+                    ctx_info.emitter = emitter
+                    waiter: asyncio.Future[None] = asyncio.get_event_loop().create_future()
+                    ctx_info.waiter = waiter
+                    logger.debug("Using warm context", extra={"context_id": warm.context_id})
+
+                    # Trigger creation of the next warm context
+                    asyncio.create_task(self._ensure_warm_context())
+                    return warm.context_id, waiter, warm.connection
+            except asyncio.TimeoutError:
+                logger.debug("Warm context not ready in time, creating fresh")
+                # Close the stale warm context
+                warm.connection.close_context(warm.context_id)
+            except Exception as e:
+                logger.debug("Failed to use warm context", exc_info=e)
+
+        # Fall back to creating a fresh context
+        result = await self._acquire_context_cold(emitter, opts, timeout)
+
+        # Trigger creation of the next warm context
+        asyncio.create_task(self._ensure_warm_context())
+        return result
+
+    async def _acquire_context_cold(
+        self,
+        emitter: tts.AudioEmitter,
+        opts: _TTSOptions,
+        timeout: float,
+    ) -> tuple[str, asyncio.Future[None], _InworldConnection]:
+        """Acquire a context without using warm context pool."""
         start_time = time.time()
         remaining_timeout = timeout
 
@@ -645,9 +719,68 @@ class _ConnectionPool:
                     "Timed out waiting for available connection capacity"
                 ) from None
 
+    async def _ensure_warm_context(self) -> None:
+        """Pre-create a warm context for the next turn."""
+        if self._closed or self._warm_context is not None or self._warm_context_opts is None:
+            return
+
+        opts = self._warm_context_opts
+        try:
+            # Find a connection with capacity
+            conn: _InworldConnection | None = None
+            async with self._pool_lock:
+                for existing in self._connections:
+                    if not existing._closed and existing.has_capacity:
+                        conn = existing
+                        break
+
+                if conn is None and len(self._connections) < self._max_connections:
+                    conn = _InworldConnection(
+                        session=self._session,
+                        ws_url=self._ws_url,
+                        authorization=self._authorization,
+                        on_capacity_available=self.notify_capacity_available,
+                    )
+                    self._connections.append(conn)
+
+            if conn is None:
+                return
+
+            await conn.connect()
+
+            # Create context without emitter (will be bound when claimed)
+            ctx_id = utils.shortuuid()
+            ready_event = asyncio.Event()
+
+            ctx_info = _ContextInfo(
+                context_id=ctx_id,
+                state=_ContextState.CREATING,
+                emitter=None,
+                waiter=None,
+                ready_event=ready_event,
+            )
+            conn._contexts[ctx_id] = ctx_info
+            conn._last_activity = time.time()
+
+            # Send create message
+            await conn._outbound_queue.put(_CreateContextMsg(context_id=ctx_id, opts=opts))
+
+            self._warm_context = _WarmContext(
+                context_id=ctx_id,
+                connection=conn,
+                opts=opts,
+                ready_event=ready_event,
+            )
+            logger.debug("Created warm context", extra={"context_id": ctx_id})
+
+        except Exception as e:
+            logger.debug("Failed to create warm context", exc_info=e)
+
     def notify_capacity_available(self) -> None:
         """Called when a context is released and capacity may be available."""
         self._capacity_available.set()
+        # Trigger warm context creation when a context closes
+        asyncio.create_task(self._ensure_warm_context())
 
     async def _cleanup_idle_connections(self) -> None:
         """Periodically close idle connections that have been unused for a while."""
@@ -681,6 +814,10 @@ class _ConnectionPool:
     async def aclose(self) -> None:
         """Close all connections in the pool."""
         self._closed = True
+
+        # Clear warm context
+        self._warm_context = None
+        self._warm_context_opts = None
 
         if self._cleanup_task:
             self._cleanup_task.cancel()
